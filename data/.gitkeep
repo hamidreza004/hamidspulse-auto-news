@@ -1,0 +1,5 @@
+# This directory stores the SQLite database
+# The database is git-ignored to avoid conflicts
+# 
+# Example file that will be created here:
+# news.db

@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  hamidspulse-auto-news:
+    build: .
+    container_name: hamidspulse-auto-news
+    restart: unless-stopped
+    
+    ports:
+      - "8000:8000"
+    
+    volumes:
+      - ./secrets:/app/secrets
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml
+    
+    env_file:
+      - .env
+    
+    environment:
+      - TZ=Asia/Tehran
+    
+    networks:
+      - hamidspulse-network
+
+networks:
+  hamidspulse-network:
+    driver: bridge
