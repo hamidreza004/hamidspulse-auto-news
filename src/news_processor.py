@@ -110,6 +110,10 @@ class NewsProcessor:
         recent_posts = self.db.get_recent_high_posts(limit=5)
         similar_post = None
         
+        # Filter out posts longer than 1600 characters from similarity check
+        if recent_posts:
+            recent_posts = [p for p in recent_posts if len(p.get('content', '')) <= 1600]
+        
         if recent_posts:
             similar_post = await self._find_similar_post_with_gpt(message_data, triage_result, recent_posts, current_state)
         
@@ -193,7 +197,7 @@ class NewsProcessor:
             triage_time_ms=triage_time_ms
         )
         
-        logger.info("Message queued for hourly digest")
+        logger.info("Message queued for 3-hour digest")
     
     async def _handle_low_importance(self, message_data: dict, triage_result: dict, triage_time_ms: int = 0):
         logger.info("Discarding LOW importance message")
@@ -215,7 +219,7 @@ class NewsProcessor:
         return await find_similar_post_with_gpt(self.gpt, message_data, triage_result, recent_posts, current_state)
     
     async def process_hourly_digest(self):
-        logger.info("Processing hourly digest")
+        logger.info("Processing 3-hour digest")
         
         try:
             pending_items = self.db.get_pending_medium_items()
@@ -250,7 +254,7 @@ class NewsProcessor:
             )
             
             if not digest_content:
-                logger.error("Failed to generate hourly digest")
+                logger.error("Failed to generate 3-hour digest")
                 return
             
             message_id = await self.telegram.post_to_channel(digest_content)
@@ -266,9 +270,9 @@ class NewsProcessor:
                 item_ids = [item['id'] for item in items_to_process]
                 self.db.mark_medium_items_processed(item_ids)
                 
-                logger.info(f"Hourly digest published: message_id={message_id}")
+                logger.info(f"3-hour digest published: message_id={message_id}")
                 
                 # Note: Situation brief is only updated via Initialize button, not automatically
                 
         except Exception as e:
-            logger.error(f"Error processing hourly digest: {e}", exc_info=True)
+            logger.error(f"Error processing 3-hour digest: {e}", exc_info=True)

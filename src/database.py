@@ -405,6 +405,55 @@ class DatabaseManager:
                 MediumQueue.processed == False
             ).count()
     
+    def get_message_from_medium_queue(self, message_id: int):
+        """Get a specific message from medium queue by ID"""
+        with self.get_session() as session:
+            item = session.query(MediumQueue).filter(MediumQueue.id == message_id).first()
+            if not item:
+                return None
+            triage = item.triage_json
+            return {
+                'id': item.id,
+                'source': item.source_channel,
+                'url': item.source_url,
+                'text': item.message_text,
+                'title': triage.get('title', 'No title'),
+                'score': item.importance_score,
+                'timestamp': item.received_at,
+                'triage_json': triage,
+                'triage_time': getattr(item, 'triage_time_ms', 0)
+            }
+    
+    def get_message_from_logs(self, message_id: int):
+        """Get a specific message from message logs by ID"""
+        with self.get_session() as session:
+            item = session.query(MessageLog).filter(MessageLog.id == message_id).first()
+            if not item:
+                return None
+            triage = item.triage_json
+            return {
+                'id': item.id,
+                'source': item.source_channel,
+                'url': item.source_url,
+                'text': item.message_text,
+                'title': triage.get('title', 'No title'),
+                'score': item.importance_score,
+                'timestamp': item.received_at,
+                'triage_json': triage,
+                'triage_time': getattr(item, 'triage_time_ms', 0),
+                'bucket': item.importance_bucket
+            }
+    
+    def remove_from_medium_queue(self, message_id: int):
+        """Remove a message from medium queue"""
+        with self.get_session() as session:
+            session.query(MediumQueue).filter(MediumQueue.id == message_id).delete()
+    
+    def delete_message_from_logs(self, message_id: int):
+        """Delete a message from message logs"""
+        with self.get_session() as session:
+            session.query(MessageLog).filter(MessageLog.id == message_id).delete()
+    
     def get_daily_statistics(self):
         """Get today's news statistics by bucket"""
         from datetime import datetime, timedelta

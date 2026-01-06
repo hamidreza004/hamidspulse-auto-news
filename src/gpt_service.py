@@ -34,7 +34,7 @@ class GPTService:
 خروجی: فقط JSON (بدون markdown، بدون توضیح اضافه):
 {{
   "bucket": "high" | "medium" | "low",
-  "novelty_delta": "یک جمله فارسی: چه چیزی جدید است؟",
+  "novelty_delta": "یک جمله فارسی: چه چیزی در پیام مربوطه پایین به نسبت دانسته ما جدید است؟ اگر پیام بی ارزش هست هم بگو",
   "reason": "دلیل کوتاه فارسی",
   "key_points": ["نکته 1", "نکته 2"]
 }}"""
@@ -44,10 +44,18 @@ class GPTService:
 
 ---
 
-کانال منبع: {source_channel}
-لینک: {source_url}
+کانال منبع این پیام: {source_channel}
+لینک این پیام: {source_url}
 
+این اون پیامی هست که قراره تو قضاوت کنی، پیام پایین تنها چیزیه که قراره نظر خودت رو در موردش بگی، اگه خیلی کوتاهه یا نامربوطه باید همین رو ذکر کنی.
 پیام مربوطه:
+
+{message_text}
+
+میخوای یه بار دیگه تکرار میکنم پیام رو 
+
+---
+
 {message_text}
 
 ---
@@ -251,7 +259,7 @@ class GPTService:
             return response.choices[0].message.content.strip()
             
         except Exception as e:
-            print(f"Error generating hourly digest: {e}")
+            print(f"Error generating 3-hour digest: {e}")
             return None
     
     def update_situation_brief(self, current_brief: str, new_event: str, 

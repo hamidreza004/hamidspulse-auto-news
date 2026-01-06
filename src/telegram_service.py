@@ -1,7 +1,7 @@
 import os
 import asyncio
 from typing import Optional, Callable
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.tl.types import Message
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.errors import SessionPasswordNeededError, RPCError
@@ -29,6 +29,13 @@ class TelegramService:
         self._keep_alive_task: Optional[asyncio.Task] = None
         self._max_reconnect_attempts = 10
         self._reconnect_delay = 5
+        
+        # Handler state tracking to prevent duplicates
+        self._monitored_channel_ids = set()
+        self._handler_registered = False
+        
+        # Channel info cache to avoid API calls in handler (O(1) lookups)
+        self._channel_info = {}  # {channel_id: {'username': str, 'title': str}}
     
     async def start(self):
         if not all([self.api_id, self.api_hash, self.phone]):
@@ -86,15 +93,24 @@ class TelegramService:
             if not username:
                 continue
             
-            if not username.startswith('@'):
-                username = f'@{username}'
-            
             try:
-                entity = await self.client.get_entity(username)
+                # Parse channel identifier - could be username or c/ID
+                if username.startswith('c/'):
+                    # Extract numeric ID from c/ID format
+                    channel_id = int(username.split('/', 1)[1])
+                    logger.info(f"Validating ID-based channel: {username} (ID: {channel_id})")
+                    entity = await self.client.get_entity(channel_id)
+                else:
+                    # Regular username - add @ if missing
+                    if not username.startswith('@'):
+                        username = f'@{username}'
+                    entity = await self.client.get_entity(username)
+                
                 valid_channels.append(entity)
-                logger.info(f"Validated channel: {username.lstrip('@')}")
+                logger.info(f"Validated channel: {getattr(entity, 'title', username)}")
             except Exception as e:
                 logger.error(f"Could not add channel {username}: {e}")
+                continue
         
         if not valid_channels:
             logger.warning("No valid channels to listen to")
@@ -104,68 +120,109 @@ class TelegramService:
         logger.info(f"Registering message handler for channels: {[c.username or c.title for c in valid_channels]}")
         logger.info(f"Channel entities: {[(c.id, c.username, c.title) for c in valid_channels]}")
         
-        # Store channel IDs for filtering
-        monitored_channel_ids = {c.id for c in valid_channels}
-        logger.info(f"Monitored source channel IDs: {monitored_channel_ids}")
+        # Update monitored channel IDs and cache channel info
+        self._monitored_channel_ids = {c.id for c in valid_channels}
         
-        # Register handler for ALL incoming messages (including muted channels)
-        @self.client.on(events.NewMessage(incoming=True))
-        async def new_message_handler(event: events.NewMessage.Event):
-            chat = await event.get_chat()
-            chat_id = getattr(chat, 'id', None)
-            chat_username = getattr(chat, 'username', None)
-            chat_title = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_id)
+        # Build channel info cache for O(1) lookups in handler
+        for channel in valid_channels:
+            username = getattr(channel, 'username', None)
+            if not username:
+                # Resolve real ID for private channels
+                real_id, _ = utils.resolve_id(channel.id)
+                username = f"c/{real_id}"
             
-            # Log ALL incoming messages for visibility
-            logger.info(f"[INCOMING] {chat_title} (ID: {chat_id})")
-            
-            # Only process messages from our monitored source channels
-            if chat_id not in monitored_channel_ids:
-                return
-            
-            logger.info(f"[SOURCE ✓] Processing message from {chat_title}")
-            try:
-                message: Message = event.message
-                
-                chat = await event.get_chat()
-                channel_username = getattr(chat, 'username', None)
-                channel_title = getattr(chat, 'title', 'Unknown')
-                
-                if not channel_username:
-                    channel_username = f"c/{chat.id}"
-                
-                message_text = message.message or message.media
-                if not message_text:
-                    return
-                
-                if hasattr(message.media, 'caption'):
-                    message_text = message.media.caption or str(message.media)
-                
-                message_url = f"https://t.me/{channel_username}/{message.id}"
-                
-                message_data = {
-                    'source_channel': channel_title,
-                    'source_username': channel_username,
-                    'source_url': message_url,
-                    'message_text': str(message_text),
-                    'message_id': message.id,
-                    'date': message.date
-                }
-                
-                logger.info(f"Message data prepared: channel={channel_title}, text_length={len(str(message_text))}")
-                
-                if self.message_handler:
-                    await self.message_handler(message_data)
-                    logger.info(f"[QUEUE] Message sent to handler: {channel_title}")
-                
-                # Mark message as read in Telegram
+            self._channel_info[channel.id] = {
+                'username': username,
+                'title': getattr(channel, 'title', 'Unknown')
+            }
+        
+        logger.info(f"Monitored source channel IDs: {self._monitored_channel_ids}")
+        logger.info(f"Cached info for {len(self._channel_info)} channels")
+        
+        # Register handler ONLY ONCE
+        if not self._handler_registered:
+            @self.client.on(events.NewMessage(incoming=True))
+            async def new_message_handler(event: events.NewMessage.Event):
+                # O(1) handler - no API calls, just queue work
+                logger.info(f"[HANDLER] ⚡ Event triggered!")
                 try:
-                    await self.client.send_read_acknowledge(chat, message)
-                    logger.debug(f"[READ] Marked message as read in {channel_title}")
-                except Exception as read_err:
-                    logger.warning(f"[READ] Failed to mark as read: {read_err}")
-            except Exception as e:
-                logger.error(f"Error in message handler: {e}")
+                    # Get chat_id from event (has -100 prefix for channels)
+                    chat_id_marked = event.chat_id if hasattr(event, 'chat_id') else event.message.peer_id.channel_id
+                    
+                    # Resolve to real ID (strip -100 prefix) for cache lookup
+                    real_id, _ = utils.resolve_id(chat_id_marked)
+                    
+                    logger.info(f"[HANDLER] Event from chat_id: {chat_id_marked} (real: {real_id})")
+                    
+                    # Only process messages from our monitored source channels (compare real IDs)
+                    if real_id not in self._monitored_channel_ids:
+                        logger.info(f"[HANDLER] Chat {real_id} not in monitored list, skipping")
+                        return
+                    
+                    # Get cached channel info (O(1) lookup, no API call)
+                    channel_info = self._channel_info.get(real_id, {})
+                    channel_username = channel_info.get('username', f'c/{real_id}')
+                    channel_title = channel_info.get('title', 'Unknown')
+                    
+                    # Calculate message latency
+                    import datetime
+                    from datetime import timezone
+                    latency = (datetime.datetime.now(timezone.utc) - event.message.date).total_seconds()
+                    logger.info(f"[SOURCE ✓] {channel_title} | Latency: {latency:.1f}s")
+                    
+                    # Build URL (no API calls)
+                    if channel_username.startswith('c/'):
+                        message_url = f"https://t.me/{channel_username}/{event.message.id}"
+                    else:
+                        message_url = f"https://t.me/{channel_username}/{event.message.id}"
+                    
+                    # Get message text
+                    message_text = event.message.message
+                    
+                    # Handle media messages
+                    if not message_text and event.message.media:
+                        # Check if media has a caption
+                        if hasattr(event.message.media, 'caption') and event.message.media.caption:
+                            message_text = event.message.media.caption
+                        else:
+                            # Skip messages with media but no caption (multi-image post fragments)
+                            logger.info(f"[HANDLER] Skipping media-only message (no caption) from {channel_title}")
+                            return
+                    
+                    # Skip if still no text
+                    if not message_text:
+                        logger.info(f"[HANDLER] Skipping message with no text from {channel_title}")
+                        return
+                    
+                    # Prepare data (all O(1) operations)
+                    message_data = {
+                        'source_channel': channel_title,
+                        'source_username': channel_username,
+                        'source_url': message_url,
+                        'message_text': str(message_text),
+                        'message_id': event.message.id,
+                        'date': event.message.date
+                    }
+                    
+                    # Queue message (non-blocking)
+                    if self.message_handler:
+                        await self.message_handler(message_data)
+                    
+                    # Schedule read ack with 2s delay to avoid first message miss
+                    async def delayed_read_ack():
+                        await asyncio.sleep(2.0)
+                        try:
+                            await self.client.send_read_acknowledge(chat_id_marked, max_id=event.message.id)
+                        except Exception as e:
+                            logger.debug(f"[READ] Delayed ack failed: {e}")
+                    
+                    asyncio.create_task(delayed_read_ack())
+                    
+                except Exception as e:
+                    logger.error(f"Error in message handler: {e}", exc_info=True)
+            
+            self._handler_registered = True
+            logger.info("[HANDLER] ✓ Message handler registered (will not register again)")
         
         logger.info("=" * 80)
         logger.info("✓ Handler registered with events.NewMessage(incoming=True)")
@@ -243,12 +300,28 @@ class TelegramService:
                 if dialog.is_channel or dialog.is_group:
                     entity = dialog.entity
                     username = getattr(entity, 'username', None)
+                    
+                    # If username is None, try fetching full entity
                     if not username:
-                        username = f"c/{entity.id}"
+                        try:
+                            full_entity = await self.client.get_entity(entity.id)
+                            username = getattr(full_entity, 'username', None)
+                            if username:
+                                logger.debug(f"[RESOLVE] Got username for {getattr(entity, 'title', 'channel')}: @{username}")
+                        except Exception as e:
+                            logger.debug(f"[RESOLVE] Could not fetch full entity: {e}")
+                    
+                    # Build username string
+                    if username:
+                        username_str = username
+                    else:
+                        # Use real ID (strip -100 prefix)
+                        real_id, _ = utils.resolve_id(entity.id)
+                        username_str = f"c/{real_id}"
                     
                     channels.append({
                         'id': entity.id,
-                        'username': username,
+                        'username': username_str,
                         'title': getattr(entity, 'title', 'Unknown'),
                         'participants_count': getattr(entity, 'participants_count', 0),
                         'is_broadcast': getattr(entity, 'broadcast', False),
@@ -295,20 +368,52 @@ class TelegramService:
             return []
         
         try:
-            if not channel_username.startswith('@'):
-                channel_username = f'@{channel_username}'
+            # Strip @ prefix for checking (handles both @c/ID and c/ID)
+            username_clean = channel_username.lstrip('@')
             
-            entity = await self.client.get_entity(channel_username)
+            # Parse channel identifier - could be username or c/ID
+            if username_clean.startswith('c/'):
+                # Extract numeric ID from c/ID format
+                channel_id = int(username_clean.split('/', 1)[1])
+                logger.debug(f"[REPLAY] Fetching messages from ID-based channel: {username_clean} (ID: {channel_id})")
+                entity = await self.client.get_entity(channel_id)
+                username_for_url = username_clean  # Keep c/ID format for fallback URL
+            else:
+                # Regular username
+                if not channel_username.startswith('@'):
+                    channel_username = f'@{channel_username}'
+                entity = await self.client.get_entity(channel_username)
+                username_for_url = channel_username.lstrip('@')
             messages = []
+            max_message_id = 0
             
             async for message in self.client.iter_messages(entity, limit=limit):
                 if message.text:
+                    # Use entity username if available, otherwise use the input identifier
+                    actual_username = getattr(entity, 'username', None)
+                    if actual_username:
+                        msg_url = f"https://t.me/{actual_username}/{message.id}"
+                    else:
+                        # For private/ID-based channels, use c/ID format
+                        msg_url = f"https://t.me/{username_for_url}/{message.id}"
+                    
                     messages.append({
                         'id': message.id,
                         'text': message.text,
                         'date': message.date,
-                        'url': f"https://t.me/{channel_username.lstrip('@')}/{message.id}"
+                        'url': msg_url
                     })
+                    # Track max message ID for read acknowledgment
+                    if message.id > max_message_id:
+                        max_message_id = message.id
+            
+            # Mark fetched messages as read
+            if max_message_id > 0:
+                try:
+                    await self.client.send_read_acknowledge(entity, max_id=max_message_id)
+                    logger.debug(f"[READ] Marked replay messages as read in {channel_username} (up to {max_message_id})")
+                except Exception as e:
+                    logger.debug(f"[READ] Failed to mark replay messages as read: {e}")
             
             return messages
         except Exception as e:

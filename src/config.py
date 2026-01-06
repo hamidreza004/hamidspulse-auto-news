@@ -48,22 +48,6 @@ class Config:
         return self.get('target_channel.username', 'hamidspulse')
     
     @property
-    def source_channels(self) -> List[str]:
-        return self.get('source_channels', [])
-    
-    def add_source_channel(self, username: str):
-        channels = self.source_channels
-        if username not in channels:
-            channels.append(username)
-            self.set('source_channels', channels)
-    
-    def remove_source_channel(self, username: str):
-        channels = self.source_channels
-        if username in channels:
-            channels.remove(username)
-            self.set('source_channels', channels)
-    
-    @property
     def high_threshold(self) -> int:
         return self.get('thresholds.high_threshold', 85)
     
@@ -74,6 +58,14 @@ class Config:
     @property
     def max_posts_per_hour(self) -> int:
         return self.get('rate_limits.max_posts_per_hour', 5)
+    
+    @property
+    def auth_username(self) -> str:
+        return self.get('auth.username', 'admin')
+    
+    @property
+    def auth_password(self) -> str:
+        return self.get('auth.password', 'admin')
     
     @property
     def triage_model(self) -> str:

@@ -1,3 +1,8 @@
+# Authentication
+auth:
+  username: admin
+  password: hamidspulse2026
+
 content_style:
   core_characteristics:
   - هویت و مأموریت
@@ -303,14 +308,6 @@ logging:
 rate_limits:
   max_posts_per_hour: 7
   max_queue_items: 50
-source_channels:
-- '@ttttsgheae'
-- '@akharinkhabar'
-- '@VahidOnline'
-- '@Middle_East_Spectator'
-- '@abdimedianet'
-- '@ClashReport'
-- '@news_bbc_persian'
 target_channel: hamidspulse
 thresholds:
   high_threshold: 85

@@ -1,10 +1,14 @@
 import asyncio
 import logging
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse
-from typing import List
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, Cookie
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import logging
+import secrets
+import hashlib
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -12,16 +16,24 @@ logger = logging.getLogger(__name__)
 
 class WebUI:
     def __init__(self, app_manager):
-        self.app = FastAPI(title="Hamid's Pulse - Control Panel")
+        self.app = FastAPI()
         self.app_manager = app_manager
-        self.active_connections: List[WebSocket] = []
+        self.active_connections = []
+        self.sessions = {}  # session_token -> {username, expires_at}
         self.connection_counter = 0
+        
+        # Mount static files directory for serving images
+        self.app.mount("/data", StaticFiles(directory="data"), name="data")
         
         self._setup_routes()
     
     def _setup_routes(self):
         @self.app.get("/", response_class=HTMLResponse)
-        async def home():
+        async def home(request: Request):
+            # Check authentication
+            session_token = request.cookies.get('session_token')
+            if not self._verify_session(session_token):
+                return self._get_login_html()
             return self._get_html()
         
         @self.app.websocket("/ws")
@@ -148,6 +160,46 @@ class WebUI:
         async def get_state():
             return {"state": self.app_manager.get_current_state()}
         
+        @self.app.post("/api/login")
+        async def login(request: Request, response: Response):
+            try:
+                body = await request.json()
+                username = body.get('username')
+                password = body.get('password')
+                
+                # Verify credentials from config
+                if username == self.app_manager.config.auth_username and password == self.app_manager.config.auth_password:
+                    # Create session token
+                    session_token = secrets.token_urlsafe(32)
+                    expires_at = datetime.now() + timedelta(days=10)
+                    
+                    self.sessions[session_token] = {
+                        'username': username,
+                        'expires_at': expires_at
+                    }
+                    
+                    response.set_cookie(
+                        key='session_token',
+                        value=session_token,
+                        max_age=10 * 24 * 60 * 60,  # 10 days in seconds
+                        httponly=True,
+                        samesite='lax'
+                    )
+                    
+                    return {"success": True, "message": "Login successful"}
+                else:
+                    return {"success": False, "error": "Invalid credentials"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        
+        @self.app.post("/api/logout")
+        async def logout(request: Request, response: Response):
+            session_token = request.cookies.get('session_token')
+            if session_token in self.sessions:
+                del self.sessions[session_token]
+            response.delete_cookie('session_token')
+            return {"success": True}
+        
         @self.app.get("/api/queue")
         async def get_queue():
             try:
@@ -212,12 +264,38 @@ class WebUI:
                 body = await request.json()
                 minutes = body.get('minutes', 10)
                 await self._broadcast({"type": "log", "data": {"message": f"Starting replay of past {minutes} minutes...", "level": "info"}})
-                source_channels = self.app_manager.config.source_channels
+                source_channels = self.app_manager.db.get_active_source_channels()
                 await self.app_manager._replay_recent_messages(source_channels, minutes=minutes, broadcast_callback=self._broadcast)
                 await self._broadcast({"type": "log", "data": {"message": "Replay complete!", "level": "success"}})
                 return {"success": True, "message": "Replay completed"}
             except Exception as e:
                 await self._broadcast({"type": "log", "data": {"message": f"Replay failed: {str(e)}", "level": "error"}})
+                return {"success": False, "error": str(e)}
+        
+        @self.app.post("/api/message/promote")
+        async def promote_message(request: Request):
+            if not self.app_manager.telegram or not self.app_manager.telegram.is_running:
+                return {"success": False, "error": "System must be running"}
+            try:
+                body = await request.json()
+                message_id = body.get('message_id')
+                current_bucket = body.get('current_bucket')
+                result = await self.app_manager.promote_message(message_id, current_bucket, broadcast_callback=self._broadcast)
+                return result
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        
+        @self.app.post("/api/message/demote")
+        async def demote_message(request: Request):
+            if not self.app_manager.telegram or not self.app_manager.telegram.is_running:
+                return {"success": False, "error": "System must be running"}
+            try:
+                body = await request.json()
+                message_id = body.get('message_id')
+                current_bucket = body.get('current_bucket')
+                result = await self.app_manager.demote_message(message_id, current_bucket, broadcast_callback=self._broadcast)
+                return result
+            except Exception as e:
                 return {"success": False, "error": str(e)}
         
         @self.app.post("/api/initialize-situation")
@@ -366,8 +444,159 @@ class WebUI:
             }
         })
     
+    def _verify_session(self, session_token: str) -> bool:
+        """Verify if session token is valid and not expired"""
+        if not session_token or session_token not in self.sessions:
+            return False
+        
+        session = self.sessions[session_token]
+        if datetime.now() > session['expires_at']:
+            # Session expired, remove it
+            del self.sessions[session_token]
+            return False
+        
+        return True
+    
+    def _get_login_html(self) -> str:
+        """Return login page HTML"""
+        return r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HAMID'S PULSE - LOGIN</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            font-family: 'IBM Plex Mono', monospace;
+        }
+        body {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-card {
+            background: rgba(30, 41, 59, 0.8);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(148, 163, 184, 0.1);
+            border-radius: 16px;
+            padding: 48px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            max-width: 400px;
+            width: 100%;
+        }
+        .input-field {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            color: #e2e8f0;
+            padding: 12px 16px;
+            border-radius: 8px;
+            width: 100%;
+            transition: all 0.3s;
+        }
+        .input-field:focus {
+            outline: none;
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+        .btn-login {
+            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            width: 100%;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        .btn-login:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+        }
+        .btn-login:active {
+            transform: translateY(0);
+        }
+        .error-message {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #fca5a5;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            display: none;
+        }
+        .logo {
+            font-size: 24px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+            margin-bottom: 32px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="logo">🔒 HAMID'S PULSE</div>
+        <div id="errorMessage" class="error-message"></div>
+        <form id="loginForm" onsubmit="handleLogin(event)">
+            <div style="margin-bottom: 20px;">
+                <label style="color: #94a3b8; font-size: 14px; margin-bottom: 8px; display: block;">Username</label>
+                <input type="text" id="username" class="input-field" placeholder="Enter username" required autofocus>
+            </div>
+            <div style="margin-bottom: 24px;">
+                <label style="color: #94a3b8; font-size: 14px; margin-bottom: 8px; display: block;">Password</label>
+                <input type="password" id="password" class="input-field" placeholder="Enter password" required>
+            </div>
+            <button type="submit" class="btn-login">LOGIN</button>
+        </form>
+    </div>
+
+    <script>
+        async function handleLogin(event) {
+            event.preventDefault();
+            
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const errorDiv = document.getElementById('errorMessage');
+            
+            errorDiv.style.display = 'none';
+            
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                
+                const data = await res.json();
+                
+                if (data.success) {
+                    window.location.href = '/';
+                } else {
+                    errorDiv.textContent = data.error || 'Login failed';
+                    errorDiv.style.display = 'block';
+                }
+            } catch (e) {
+                errorDiv.textContent = 'Connection error: ' + e.message;
+                errorDiv.style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>
+        """
+    
     def _get_html(self) -> str:
-        return """
+        return r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -738,6 +967,21 @@ class WebUI:
             height: 20px;
         }
         
+        /* Priority Action Icons */
+        .priority-action-icon {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+            opacity: 0.5;
+            transition: all 0.2s;
+        }
+        
+        .priority-action-icon:hover {
+            opacity: 1;
+            filter: drop-shadow(0 0 4px currentColor);
+            transform: scale(1.15);
+        }
+        
         /* Terminal Text */
         .terminal-text {
             font-family: 'VT323', monospace;
@@ -770,14 +1014,19 @@ class WebUI:
     </style>
 </head>
 <body class="min-h-screen p-6">
-    <div x-data="app()" x-init="init()" class="max-w-7xl mx-auto">
+    <!-- Fixed Left Sidebar -->
+    <div class="fixed left-0 top-0 h-full w-24 flex items-start justify-center pt-8" style="z-index: 1000; background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(10px); border-right: 1px solid rgba(96, 165, 250, 0.2);">
+        <img src="/data/channel.jpg" alt="Channel Logo" class="w-16 h-16 rounded-full border-2 border-terminal/30">
+    </div>
+    
+    <div x-data="app()" x-init="init()" class="max-w-7xl" style="margin: 0 auto; padding-left: 96px;">
         
         <!-- Header -->
         <div class="header-gradient text-center mb-6">
             <h1 class="text-4xl font-bold text-terminal mb-2 flex items-center justify-center gap-3 mono">
                 <i data-lucide="radio" class="icon-lg scanning"></i>
                 HAMID'S PULSE CONTROL PANEL
-                <i data-lucide="sliders-horizontal" class="icon-lg scanning"></i>
+                <i data-lucide="radio" class="icon-lg scanning"></i>
             </h1>
             <div class="text-terminal mono scanning" style="font-size: 1.15rem;">[ AUTOMATED NEWS CHANNEL MANAGEMENT SYSTEM v2.0 ]</div>
         </div>
@@ -935,7 +1184,7 @@ class WebUI:
                 </div>
 
                 <!-- Active Sources -->
-                <div x-show="channelTab === 'active'" class="space-y-2 max-h-64 overflow-y-auto scrollbar">
+                <div x-show="channelTab === 'active'" class="space-y-2" style="max-height: 600px; overflow-y: auto;">
                     <template x-for="source in filteredSources" :key="source.username">
                         <div class="border border-glow p-3 flex justify-between items-center gap-4">
                             <div class="flex-1">
@@ -958,7 +1207,7 @@ class WebUI:
                 </div>
 
                 <!-- All Telegram Channels -->
-                <div x-show="channelTab === 'available'" class="space-y-2 max-h-64 overflow-y-auto scrollbar">
+                <div x-show="channelTab === 'available'" class="space-y-2" style="max-height: 600px; overflow-y: auto;">
                     <template x-for="channel in filteredTelegramChannels" :key="channel.id">
                         <div class="border border-glow p-3 flex justify-between items-center gap-4">
                             <div class="flex-1">
@@ -1011,9 +1260,7 @@ class WebUI:
                 <!-- Current State Tab -->
                 <div x-show="briefTab === 'current'" class="space-y-2">
                     <div class="text-xs opacity-70 mb-1">CURRENT SITUATION BRIEF:</div>
-                    <textarea x-model="currentState" @input="stateChanged = true"
-                        placeholder="Enter current situation brief..."
-                        class="input-field w-full persian-text text-xs resize-y" style="height: 600px;"></textarea>
+                    <textarea x-model="currentState" @input="stateChanged = true" class="w-full p-4 border border-terminal/30 rounded-lg text-bright persian-text resize-none focus:border-terminal focus:outline-none text-xs" style="height: 576px; background: rgba(15, 23, 42, 0.4);" placeholder="وضعیت فعلی خبری را وارد کنید..."></textarea>
                     <button @click="saveCurrentState()" :disabled="!stateChanged" class="btn w-full flex items-center justify-center gap-2">
                         <i :data-lucide="stateChanged ? 'save' : 'check'" class="icon-sm"></i>
                         <span x-text="stateChanged ? 'SAVE CHANGES' : 'NO CHANGES'"></span>
@@ -1024,8 +1271,8 @@ class WebUI:
                 <div x-show="briefTab === 'character'" class="space-y-2">
                     <div class="text-xs opacity-70 mb-1">CORE CHARACTERISTICS:</div>
                     <textarea x-model="characterConfig" @input="characterChanged = true"
-                        placeholder="Enter character traits (one per line)..."
-                        class="input-field w-full h-32 persian-text text-xs"></textarea>
+                        placeholder="Enter channel personality and writing style..."
+                        class="w-full p-4 border border-terminal/30 rounded-lg text-bright persian-text resize-none focus:border-terminal focus:outline-none text-xs" style="height: 576px; background: rgba(15, 23, 42, 0.4);"></textarea>
                     <button @click="saveCharacterConfig()" :disabled="!characterChanged" class="btn w-full flex items-center justify-center gap-2">
                         <i :data-lucide="characterChanged ? 'save' : 'check'" class="icon-sm"></i>
                         <span x-text="characterChanged ? 'SAVE CHANGES' : 'NO CHANGES'"></span>
@@ -1036,11 +1283,11 @@ class WebUI:
                 <div x-show="briefTab === 'emoji'" class="space-y-2">
                     <div class="text-xs opacity-70 mb-1">EMOJI COUNT (HIGH NEWS):</div>
                     <input x-model.number="emojiCount" @input="emojiChanged = true"
-                        class="input-field w-full text-xs mb-2" type="number" min="0" max="10">
-                    <div class="text-xs opacity-70 mb-1">EMOJI SELECTION GUIDELINES:</div>
+                        class="w-full p-3 border border-terminal/30 rounded-lg text-bright text-xs focus:border-terminal focus:outline-none" style="background: rgba(15, 23, 42, 0.4);" type="number" min="0" max="10">
+                    <div class="text-xs opacity-70 mb-1 mt-4">EMOJI SELECTION GUIDELINES:</div>
                     <textarea x-model="emojiGuidelines" @input="emojiChanged = true"
                         placeholder="Explain how emojis should be selected..."
-                        class="input-field w-full h-24 persian-text text-xs"></textarea>
+                        class="w-full p-4 border border-terminal/30 rounded-lg text-bright persian-text resize-none focus:border-terminal focus:outline-none text-xs" style="height: 520px; background: rgba(15, 23, 42, 0.4);"></textarea>
                     <button @click="saveEmojiConfig()" :disabled="!emojiChanged" class="btn w-full flex items-center justify-center gap-2">
                         <i :data-lucide="emojiChanged ? 'save' : 'check'" class="icon-sm"></i>
                         <span x-text="emojiChanged ? 'SAVE CHANGES' : 'NO CHANGES'"></span>
@@ -1068,7 +1315,12 @@ class WebUI:
                 <div class="space-y-2 max-h-[600px] overflow-y-auto scrollbar">
                     <template x-for="msg in highQueue" :key="msg.id">
                         <div class="message-card high">
-                            <div class="font-semibold persian-text mb-2 text-bright" x-text="msg.title"></div>
+                            <div class="flex justify-between items-start mb-2">
+                                <div class="font-semibold persian-text text-bright flex-1" x-text="msg.title"></div>
+                                <div class="flex items-center gap-2 ml-2">
+                                    <i @click="demoteMessage(msg.id, 'high')" data-lucide="chevron-down" class="priority-action-icon text-red-400" title="Demote to Medium"></i>
+                                </div>
+                            </div>
                             <div class="text-xs text-muted mb-2"><span x-text="msg.source"></span></div>
                             <div class="text-xs text-muted flex justify-between items-center">
                                 <span x-text="new Date(msg.timestamp).toLocaleString('en-US', {timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric'})"></span>
@@ -1099,7 +1351,13 @@ class WebUI:
                 <div class="space-y-2 max-h-[600px] overflow-y-auto scrollbar">
                     <template x-for="msg in mediumQueue" :key="msg.id">
                         <div class="message-card medium">
-                            <div class="font-semibold persian-text mb-2 text-bright" x-text="msg.title"></div>
+                            <div class="flex justify-between items-start mb-2">
+                                <div class="font-semibold persian-text text-bright flex-1" x-text="msg.title"></div>
+                                <div class="flex flex-col items-center gap-1 ml-2">
+                                    <i @click="promoteMessage(msg.id, 'medium')" data-lucide="chevron-up" class="priority-action-icon text-green-400" title="Promote to High"></i>
+                                    <i @click="demoteMessage(msg.id, 'medium')" data-lucide="chevron-down" class="priority-action-icon text-red-400" title="Demote to Low"></i>
+                                </div>
+                            </div>
                             <div class="text-xs text-muted mb-2"><span x-text="msg.source"></span></div>
                             <div class="text-xs text-muted flex justify-between items-center">
                                 <span x-text="new Date(msg.timestamp).toLocaleString('en-US', {timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric'})"></span>
@@ -1130,7 +1388,13 @@ class WebUI:
                 <div class="space-y-2 max-h-[600px] overflow-y-auto scrollbar">
                     <template x-for="msg in lowQueue" :key="msg.id">
                         <div class="message-card low">
-                            <div class="font-semibold persian-text mb-2 text-bright" x-text="msg.title"></div>
+                            <div class="flex justify-between items-start mb-2">
+                                <div class="font-semibold persian-text text-bright flex-1" x-text="msg.title"></div>
+                                <div class="flex flex-col items-center gap-1 ml-2">
+                                    <i @click="promoteMessage(msg.id, 'low')" data-lucide="chevron-up" class="priority-action-icon text-green-400" title="Promote to Medium"></i>
+                                    <i @click="demoteMessage(msg.id, 'low')" data-lucide="x" class="priority-action-icon text-red-400" title="Remove from Queue"></i>
+                                </div>
+                            </div>
                             <div class="text-xs text-muted mb-2"><span x-text="msg.source"></span></div>
                             <div class="text-xs text-muted flex justify-between items-center">
                                 <span x-text="new Date(msg.timestamp).toLocaleString('en-US', {timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric'})"></span>
@@ -1155,22 +1419,21 @@ class WebUI:
                     </span>
                     <span class="priority-badge high" style="background: rgba(16, 185, 129, 0.15); color: #6ee7b7;" x-text="publishedPosts.length"></span>
                 </div>
-                <div class="space-y-2 max-h-[400px] overflow-y-auto scrollbar">
+                <div class="space-y-2 scrollbar" style="max-height: 600px; overflow-y: auto;">
                     <template x-for="post in publishedPosts" :key="post.id">
                         <div class="message-card published">
                             <div class="flex justify-between items-start mb-2">
                                 <span class="font-semibold text-green-400" x-text="post.type.toUpperCase()"></span>
                                 <div class="flex items-center gap-2">
                                     <span class="text-xs text-muted" x-text="new Date(post.timestamp).toLocaleString('en-US', {timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric'})"></span>
-                                    <button @click="deletePost(post.id, post.message_id)" class="text-red-400 hover:text-red-300 transition-colors" title="Delete">
+                                    <button @click="deletePost(post.id)" class="text-red-400 hover:text-red-300 text-xs">
                                         <i data-lucide="trash-2" class="icon-sm"></i>
                                     </button>
                                 </div>
                             </div>
-                            <div class="persian-text mb-2 leading-relaxed text-bright" x-text="post.content"></div>
-                            <div class="flex justify-between items-center text-xs text-muted">
-                                <span x-show="post.message_id">Msg ID: <span x-text="post.message_id"></span></span>
-                                <span x-show="post.source_urls">Sources: <span x-text="post.source_urls"></span></span>
+                            <div class="text-sm persian-text mb-2" style="line-height: 1.6;" x-html="formatTelegramText(post.content)"></div>
+                            <div class="text-xs text-muted" x-show="post.message_id">
+                                Msg ID: <span x-text="post.message_id"></span>
                             </div>
                         </div>
                     </template>
@@ -1823,6 +2086,79 @@ class WebUI:
                         }
                     } catch (e) {
                         this.addLog('Failed to clear low queue', 'error');
+                    }
+                },
+                
+                formatTelegramText(text) {
+                    if (!text) return '';
+                    
+                    console.log('[FORMAT] Original text:', text.substring(0, 100));
+                    
+                    // Escape HTML first
+                    let formatted = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    
+                    // Parse Telegram markdown links [text](url)
+                    formatted = formatted.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" class="text-blue-400 hover:text-blue-300 underline">$1</a>');
+                    
+                    // Parse **bold**
+                    formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+                    
+                    // Parse __bold__ (alternative)
+                    formatted = formatted.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+                    
+                    // Parse *italic* or _italic_
+                    formatted = formatted.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+                    formatted = formatted.replace(/_([^_]+)_/g, '<em>$1</em>');
+                    
+                    // Parse ~~strikethrough~~
+                    formatted = formatted.replace(/~~([^~]+)~~/g, '<s>$1</s>');
+                    
+                    // Parse `code`
+                    formatted = formatted.replace(/`([^`]+)`/g, '<code class="bg-gray-700 px-1 rounded">$1</code>');
+                    
+                    // Convert line breaks to <br>
+                    formatted = formatted.replace(/\n/g, '<br>');
+                    
+                    console.log('[FORMAT] Formatted text:', formatted.substring(0, 100));
+                    return formatted;
+                },
+                
+                async promoteMessage(messageId, currentBucket) {
+                    try {
+                        const res = await fetch('/api/message/promote', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ message_id: messageId, current_bucket: currentBucket })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            await this.loadQueue();
+                            await this.loadPublishedPosts();
+                        } else {
+                            alert('Failed to promote: ' + (data.error || 'Unknown error'));
+                        }
+                    } catch (e) {
+                        console.error('Failed to promote message:', e);
+                        alert('Failed to promote message');
+                    }
+                },
+                
+                async demoteMessage(messageId, currentBucket) {
+                    try {
+                        const res = await fetch('/api/message/demote', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ message_id: messageId, current_bucket: currentBucket })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            await this.loadQueue();
+                        } else {
+                            alert('Failed to demote: ' + (data.error || 'Unknown error'));
+                        }
+                    } catch (e) {
+                        console.error('Failed to demote message:', e);
+                        alert('Failed to demote message');
                     }
                 },
                 

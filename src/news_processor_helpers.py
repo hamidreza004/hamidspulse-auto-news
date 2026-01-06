@@ -27,13 +27,10 @@ async def find_similar_post_with_gpt(gpt_service, message_data: dict, triage_res
     
     system_prompt = f"""You are a news similarity analyzer for "Hamid's Pulse" channel.
 
-Channel characteristics:
-{core_characteristics}
-
 Current situation:
-{current_state[:500]}
+{current_state}
 
-Task: Determine if a new message is about the SAME topic/event as any recent post.
+Task: Determine if a new message is about the SAME topic/event as any recent post, feel free to leave 0 that means the category is whole different.
 
 Output ONLY JSON (no markdown, no explanation):
 {{
@@ -49,8 +46,11 @@ Output ONLY JSON (no markdown, no explanation):
 
 ---
 
-New message:
-{message_data['message_text'][:500]}
+New message: (this below message is exactly what you should analyze with to posts above)
+{message_data['message_text']}
+
+another time, the message is:
+{message_data['message_text']}
 
 Key points: {', '.join(triage_result.get('key_points', []))}
 Novelty: {triage_result.get('novelty_delta', '')}

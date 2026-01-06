@@ -137,10 +137,34 @@ class AppManager:
         
         username_clean = username.lstrip('@')
         
-        # Get channel info via Telegram
+        # Get channel info via Telegram - use same logic as get_all_subscribed_channels
         try:
-            entity = await self.telegram.client.get_entity(username)
-            title = getattr(entity, 'title', username.lstrip('@'))
+            # Parse channel identifier - could be @username or @c/ID
+            if username_clean.startswith('c/'):
+                # Extract numeric ID from c/ID format
+                channel_id = int(username_clean.split('/', 1)[1])
+                logger.info(f"[ADD] Detected ID-based channel, using ID: {channel_id}")
+                entity = await self.telegram.client.get_entity(channel_id)
+            else:
+                # Regular username
+                entity = await self.telegram.client.get_entity(username)
+            
+            # Get username from entity (might be None for ID-based channels)
+            entity_username = getattr(entity, 'username', None)
+            
+            # If username is None, fetch full entity for complete info
+            if not entity_username:
+                try:
+                    from telethon import utils
+                    full_entity = await self.telegram.client.get_entity(entity.id)
+                    entity_username = getattr(full_entity, 'username', None)
+                    entity = full_entity  # Use full entity for title
+                    logger.info(f"[RESOLVE] Fetched full entity for channel, title: {getattr(entity, 'title', 'Unknown')}")
+                except Exception as e:
+                    logger.warning(f"[RESOLVE] Could not fetch full entity: {e}")
+            
+            # Get title (should now have proper title from full entity)
+            title = getattr(entity, 'title', username_clean)
             members = 0
             
             # Try to get member count
@@ -156,7 +180,6 @@ class AppManager:
             title = username_clean
             members = 0
         
-        self.config.add_source_channel(f'@{username_clean}')
         self.db.add_source_channel(username_clean, title=title, participants_count=members)
         
         if self.is_running:
@@ -172,7 +195,6 @@ class AppManager:
         
         username_clean = username.lstrip('@')
         
-        self.config.remove_source_channel(username)
         self.db.remove_source_channel(username_clean)
         
         logger.info(f"Removed source channel: {username_clean}")
@@ -212,7 +234,7 @@ class AppManager:
         try:
             cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
             all_messages = []
-            source_channels = self.config.source_channels
+            source_channels = self.db.get_active_source_channels()
             
             await log_broadcast(f"📊 Gathering news from {len(source_channels)} sources over past 24 hours...")
             
@@ -407,10 +429,223 @@ Based on these messages and your knowledge of current events, create a comprehen
             await self.scheduler.trigger_digest_now()
     
     async def process_and_clear_queue(self):
-        """Process hourly digest and clear queue - same as automatic hourly behavior"""
+        """Process 3-hour digest and clear queue - same as automatic behavior"""
         if self.scheduler:
             # Generate and publish digest from medium queue
             await self.scheduler.trigger_digest_now()
             # Queue is automatically cleared by process_hourly_digest after publishing
             logger.info("Manual digest processed and queue cleared")
         return True
+    
+    async def promote_message(self, message_id: int, current_bucket: str, broadcast_callback=None):
+        """Promote a message to higher priority bucket"""
+        async def log_broadcast(message, level="info"):
+            if broadcast_callback:
+                await broadcast_callback({"type": "log", "data": {"message": message, "level": level}})
+            logger.info(message)
+        
+        try:
+            # Get message from database
+            if current_bucket == 'medium':
+                # Medium -> High: Post to channel immediately
+                message = self.db.get_message_from_medium_queue(message_id)
+                if not message:
+                    return {"success": False, "error": "Message not found in medium queue"}
+                
+                await log_broadcast(f"⬆️ Promoting to HIGH: {message['title'][:50]}...")
+                
+                # Generate post content and post to channel
+                if self.gpt and self.telegram:
+                    current_state = self.db.get_current_state()
+                    
+                    # Check for similar posts
+                    recent_posts = self.db.get_recent_high_posts(limit=5)
+                    similar_post = None
+                    
+                    # Filter out posts longer than 1600 characters from similarity check
+                    if recent_posts:
+                        recent_posts = [p for p in recent_posts if len(p.get('content', '')) <= 1600]
+                    
+                    if recent_posts:
+                        from src.news_processor_helpers import find_similar_post_with_gpt
+                        message_data = {
+                            'message_text': message['text'],
+                            'source_channel': message['source'],
+                            'source_url': message['url']
+                        }
+                        similar_post = await find_similar_post_with_gpt(
+                            self.gpt, message_data, message['triage_json'], recent_posts, current_state
+                        )
+                    
+                    # Generate high priority post
+                    from concurrent.futures import ThreadPoolExecutor
+                    import asyncio
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    loop = asyncio.get_event_loop()
+                    
+                    post_content = await loop.run_in_executor(
+                        executor,
+                        self.gpt.generate_high_post,
+                        message['text'],
+                        message['source'],
+                        message['url'],
+                        message['triage_json'],
+                        current_state
+                    )
+                    
+                    if post_content:
+                        telegram_message_id = None
+                        
+                        if similar_post and similar_post.get('message_id'):
+                            # Edit existing message
+                            await log_broadcast(f"📝 Editing similar post instead of creating new one...")
+                            combined_content = f"{similar_post['content']}\n\n---\n\n{post_content}"
+                            combined_sources = similar_post.get('source_urls', []) + [message['url']]
+                            
+                            success = await self.telegram.edit_message(similar_post['message_id'], combined_content)
+                            if success:
+                                self.db.update_published_post(
+                                    post_id=similar_post['id'],
+                                    new_content=combined_content,
+                                    source_urls=combined_sources
+                                )
+                                telegram_message_id = similar_post['message_id']
+                                await log_broadcast(f"✅ Edited existing post (message_id={telegram_message_id})", "success")
+                        else:
+                            # Post new message
+                            telegram_message_id = await self.telegram.post_to_channel(post_content)
+                            
+                            if telegram_message_id:
+                                self.db.log_published_post(
+                                    post_type='high',
+                                    content=post_content,
+                                    source_urls=[message['url']],
+                                    message_id=telegram_message_id
+                                )
+                                await log_broadcast(f"✅ Posted new message to channel (message_id={telegram_message_id})", "success")
+                        
+                        if telegram_message_id:
+                            # Remove from medium queue using the correct ID
+                            self.db.remove_from_medium_queue(message['id'])
+                            self.db.log_message(
+                                message['source'],
+                                message['url'],
+                                message['text'],
+                                'high',
+                                message['score'],
+                                message['triage_json'],
+                                'promoted_and_posted',
+                                message.get('triage_time', 0)
+                            )
+                            return {"success": True, "message": "Promoted to high and posted"}
+                        else:
+                            return {"success": False, "error": "Failed to post to channel"}
+                    else:
+                        return {"success": False, "error": "Failed to generate post content"}
+                else:
+                    return {"success": False, "error": "GPT or Telegram not available"}
+            
+            elif current_bucket == 'low':
+                # Low -> Medium: Move to medium queue
+                message = self.db.get_message_from_logs(message_id)
+                if not message:
+                    return {"success": False, "error": "Message not found in logs"}
+                
+                await log_broadcast(f"⬆️ Promoting to MEDIUM: {message['title'][:50]}...")
+                
+                # Add to medium queue
+                self.db.add_to_medium_queue(
+                    message['source'],
+                    message['url'],
+                    message['text'],
+                    message['triage_json'],
+                    message['score'],
+                    message.get('triage_time', 0)
+                )
+                
+                # Remove from logs
+                self.db.delete_message_from_logs(message_id)
+                
+                await log_broadcast(f"✅ Promoted to medium queue", "success")
+                return {"success": True, "message": "Promoted to medium"}
+            
+            else:
+                return {"success": False, "error": f"Cannot promote from {current_bucket}"}
+        
+        except Exception as e:
+            logger.error(f"Error promoting message: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def demote_message(self, message_id: int, current_bucket: str, broadcast_callback=None):
+        """Demote a message to lower priority bucket or remove it"""
+        async def log_broadcast(message, level="info"):
+            if broadcast_callback:
+                await broadcast_callback({"type": "log", "data": {"message": message, "level": level}})
+            logger.info(message)
+        
+        try:
+            if current_bucket == 'high':
+                # High -> Medium: Move to medium queue
+                message = self.db.get_message_from_logs(message_id)
+                if not message:
+                    return {"success": False, "error": "Message not found in logs"}
+                
+                await log_broadcast(f"⬇️ Demoting to MEDIUM: {message['title'][:50]}...")
+                
+                # Add to medium queue
+                self.db.add_to_medium_queue(
+                    message['source'],
+                    message['url'],
+                    message['text'],
+                    message['triage_json'],
+                    message['score'],
+                    message.get('triage_time', 0)
+                )
+                
+                # Remove from high logs
+                self.db.delete_message_from_logs(message_id)
+                
+                await log_broadcast(f"✅ Demoted to medium queue", "success")
+                return {"success": True, "message": "Demoted to medium"}
+            
+            elif current_bucket == 'medium':
+                # Medium -> Low: Remove from queue, log as low
+                message = self.db.get_message_from_medium_queue(message_id)
+                if not message:
+                    return {"success": False, "error": "Message not found in medium queue"}
+                
+                await log_broadcast(f"⬇️ Demoting to LOW: {message['title'][:50]}...")
+                
+                # Remove from medium queue
+                self.db.remove_from_medium_queue(message_id)
+                
+                # Log as low priority
+                self.db.log_message(
+                    message['source'],
+                    message['url'],
+                    message['text'],
+                    'low',
+                    message['score'],
+                    message['triage_json'],
+                    'demoted_to_low',
+                    message.get('triage_time', 0)
+                )
+                
+                await log_broadcast(f"✅ Demoted to low priority", "success")
+                return {"success": True, "message": "Demoted to low"}
+            
+            elif current_bucket == 'low':
+                # Low -> Remove: Delete from logs
+                await log_broadcast(f"🗑️ Removing message from queue...")
+                
+                self.db.delete_message_from_logs(message_id)
+                
+                await log_broadcast(f"✅ Message removed", "success")
+                return {"success": True, "message": "Message removed"}
+            
+            else:
+                return {"success": False, "error": f"Cannot demote from {current_bucket}"}
+        
+        except Exception as e:
+            logger.error(f"Error demoting message: {e}")
+            return {"success": False, "error": str(e)}
