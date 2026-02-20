@@ -25,6 +25,14 @@ class WebUI:
         # Mount static files directory for serving images
         self.app.mount("/data", StaticFiles(directory="data"), name="data")
         
+        # Mount static directory for profile photos
+        import os
+        os.makedirs("./static/profile_photos", exist_ok=True)
+        self.app.mount("/static", StaticFiles(directory="static"), name="static")
+        
+        # Wire up broadcast callback for real-time logs
+        self.app_manager.set_broadcast_callback(self._broadcast)
+        
         self._setup_routes()
     
     def _setup_routes(self):
@@ -1007,6 +1015,30 @@ class WebUI:
             animation: scan 2s ease-in-out infinite;
         }
         
+        /* Stat Card Pulse */
+        @keyframes stat-pulse {
+            0%, 100% { 
+                box-shadow: 0 0 20px rgba(96, 165, 250, 0.2);
+                border-color: rgba(96, 165, 250, 0.3);
+            }
+            50% { 
+                box-shadow: 0 0 30px rgba(96, 165, 250, 0.4);
+                border-color: rgba(96, 165, 250, 0.5);
+            }
+        }
+        
+        .stat-card-pulse {
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(96, 165, 250, 0.3);
+            animation: stat-pulse 3s ease-in-out infinite;
+            transition: all 0.3s ease;
+        }
+        
+        .stat-card-pulse:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 40px rgba(96, 165, 250, 0.5);
+        }
+        
         /* Utility */
         .text-muted { color: rgba(226, 232, 240, 0.6); }
         .text-bright { color: #f1f5f9; }
@@ -1122,21 +1154,21 @@ class WebUI:
                 </div>
                 <div class="space-y-3 terminal-text">
                     <div class="grid grid-cols-2 gap-3">
-                        <div class="text-center p-3 bg-white/5 rounded-lg">
+                        <div class="text-center p-3 bg-white/10 rounded-lg stat-card-pulse">
                             <div class="text-terminal text-5xl font-bold" x-text="status.daily_stats?.today?.total || 0"></div>
                             <div class="text-muted text-base mt-1 font-semibold">TOTAL</div>
                         </div>
-                        <div class="text-center p-3 bg-green-500/10 rounded-lg border border-green-500/20">
+                        <div class="text-center p-3 bg-green-500/10 rounded-lg stat-card-pulse" style="animation-delay: 0.3s;">
                             <div class="text-success text-5xl font-bold" x-text="status.daily_stats?.today?.high || 0"></div>
                             <div class="text-success/70 text-base mt-1 font-semibold">HIGH</div>
                         </div>
                     </div>
                     <div class="grid grid-cols-2 gap-3">
-                        <div class="text-center p-3 bg-yellow-500/10 rounded-lg border border-yellow-500/20">
+                        <div class="text-center p-3 bg-yellow-500/10 rounded-lg stat-card-pulse" style="animation-delay: 0.6s;">
                             <div class="text-warning text-5xl font-bold" x-text="status.daily_stats?.medium_queue_pending || 0"></div>
                             <div class="text-warning/70 text-base mt-1 font-semibold">MEDIUM QUEUE</div>
                         </div>
-                        <div class="text-center p-3 bg-white/5 rounded-lg">
+                        <div class="text-center p-3 bg-white/10 rounded-lg stat-card-pulse" style="animation-delay: 0.9s;">
                             <div class="text-muted text-5xl font-bold" x-text="status.daily_stats?.today?.low || 0"></div>
                             <div class="text-muted/70 text-base mt-1 font-semibold">LOW</div>
                         </div>
@@ -1187,10 +1219,24 @@ class WebUI:
                 <div x-show="channelTab === 'active'" class="space-y-2" style="max-height: 600px; overflow-y: auto;">
                     <template x-for="source in filteredSources" :key="source.username">
                         <div class="border border-glow p-3 flex justify-between items-center gap-4">
-                            <div class="flex-1">
-                                <div class="font-bold">@<span x-text="source.username"></span></div>
-                                <div class="text-xs opacity-60 persian-text" x-text="source.title || 'NO TITLE'"></div>
-                                <div class="text-xs opacity-40" x-text="(source.participants_count || 0) + ' members'"></div>
+                            <div class="flex items-center gap-3 flex-1">
+                                <!-- Profile Picture -->
+                                <div class="w-12 h-12 rounded-full overflow-hidden bg-white/5 flex-shrink-0">
+                                    <img x-show="source.profile_photo_path" 
+                                         :src="source.profile_photo_path" 
+                                         class="w-full h-full object-cover"
+                                         :alt="source.username">
+                                    <div x-show="!source.profile_photo_path" 
+                                         class="w-full h-full flex items-center justify-center text-2xl font-bold opacity-50">
+                                        <i data-lucide="user" class="icon"></i>
+                                    </div>
+                                </div>
+                                <!-- Channel Info -->
+                                <div class="flex-1">
+                                    <div class="font-bold">@<span x-text="source.username"></span></div>
+                                    <div class="text-xs opacity-60 persian-text" x-text="source.title || 'NO TITLE'"></div>
+                                    <div class="text-xs opacity-40" x-text="(source.participants_count || 0) + ' members'"></div>
+                                </div>
                             </div>
                             <button @click="removeSource(source.username)" class="btn btn-danger btn-sm text-xs px-3 flex items-center gap-1">
                                 <i data-lucide="x" class="icon-sm"></i>

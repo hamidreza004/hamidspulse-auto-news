@@ -22,7 +22,7 @@ async def find_similar_post_with_gpt(gpt_service, message_data: dict, triage_res
     # Prepare recent posts list (keep it short to reduce prompt tokens)
     posts_text = ""
     for idx, post in enumerate(recent_posts, 1):
-        content = post.get('content', '')[:200]
+        content = post.get('content', '')[:500]
         posts_text += f"{idx}. {content}\n\n"
     
     system_prompt = f"""You are a news similarity analyzer for "Hamid's Pulse" channel.
@@ -30,7 +30,7 @@ async def find_similar_post_with_gpt(gpt_service, message_data: dict, triage_res
 Current situation:
 {current_state}
 
-Task: Determine if a new message is about the SAME topic/event as any recent post, feel free to leave 0 that means the category is whole different.
+Task: Determine if a new message is about the SAME topic/event as any recent post, feel free to leave 0 that means the category is different.
 
 Output ONLY JSON (no markdown, no explanation):
 {{

@@ -23,6 +23,7 @@ class AppManager:
         self.message_queue: Optional[MessageQueueManager] = None
         self.is_running = False
         self._telegram_task: Optional[asyncio.Task] = None
+        self.broadcast_callback: Optional[callable] = None
     
     def initialize(self, config_path: str = "config.yaml"):
         logger.info("Initializing application components...")
@@ -41,13 +42,15 @@ class AppManager:
             config=self.config,
             db=self.db,
             gpt=self.gpt,
-            telegram=self.telegram
+            telegram=self.telegram,
+            broadcast_callback=self._safe_broadcast
         )
         
         # Initialize message queue with processor callback
         self.message_queue = MessageQueueManager(
             db_manager=self.db,
-            processor_callback=self.processor.process_new_message
+            processor_callback=self.processor.process_new_message,
+            broadcast_callback=self._safe_broadcast
         )
         
         self.scheduler = DigestScheduler(
@@ -56,6 +59,18 @@ class AppManager:
         )
         
         logger.info("Application components initialized")
+    
+    async def _safe_broadcast(self, message: dict):
+        """Async broadcast wrapper that safely handles missing callback"""
+        if self.broadcast_callback:
+            try:
+                await self.broadcast_callback(message)
+            except Exception as e:
+                logger.debug(f"Could not broadcast: {e}")
+    
+    def set_broadcast_callback(self, callback):
+        """Set the WebSocket broadcast callback after initialization"""
+        self.broadcast_callback = callback
     
     async def start(self):
         if self.is_running:
@@ -175,18 +190,24 @@ class AppManager:
                 logger.info(f"Got member count for {username}: {members}")
             except Exception as e:
                 logger.warning(f"Could not get member count for {username}: {e}")
+            
+            # Download profile photo
+            profile_photo_path = await self.telegram.download_channel_photo(username)
+            if profile_photo_path:
+                logger.info(f"Downloaded profile photo for {username_clean}: {profile_photo_path}")
         except Exception as e:
             logger.warning(f"Could not fetch channel info for {username}: {e}")
             title = username_clean
             members = 0
+            profile_photo_path = None
         
-        self.db.add_source_channel(username_clean, title=title, participants_count=members)
+        self.db.add_source_channel(username_clean, title=title, participants_count=members, profile_photo_path=profile_photo_path)
         
         if self.is_running:
             source_channels = self.db.get_active_source_channels()
             await self.telegram.listen_to_sources(source_channels)
         
-        logger.info(f"Added source channel: {username_clean} (title: {title}, members: {members})")
+        logger.info(f"Added source channel: {username_clean} (title: {title}, members: {members}, photo: {profile_photo_path})")
     
     async def remove_source_channel(self, username: str):
         # Normalize username - add @ if missing, then remove it for database
@@ -459,7 +480,7 @@ Based on these messages and your knowledge of current events, create a comprehen
                     current_state = self.db.get_current_state()
                     
                     # Check for similar posts
-                    recent_posts = self.db.get_recent_high_posts(limit=5)
+                    recent_posts = self.db.get_recent_high_posts(limit=3)
                     similar_post = None
                     
                     # Filter out posts longer than 1600 characters from similarity check
@@ -499,7 +520,9 @@ Based on these messages and your knowledge of current events, create a comprehen
                         if similar_post and similar_post.get('message_id'):
                             # Edit existing message
                             await log_broadcast(f"📝 Editing similar post instead of creating new one...")
-                            combined_content = f"{similar_post['content']}\n\n---\n\n{post_content}"
+                            # Strip @hamidspulse signature from old content to prevent duplication
+                            old_content = similar_post['content'].replace('@hamidspulse 🔭', '').strip()
+                            combined_content = f"{old_content}\n\n---\n\n{post_content}"
                             combined_sources = similar_post.get('source_urls', []) + [message['url']]
                             
                             success = await self.telegram.edit_message(similar_post['message_id'], combined_content)

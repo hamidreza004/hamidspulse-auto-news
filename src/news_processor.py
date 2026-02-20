@@ -13,11 +13,12 @@ logger = logging.getLogger(__name__)
 
 class NewsProcessor:
     def __init__(self, config: Config, db: DatabaseManager, 
-                 gpt: GPTService, telegram: TelegramService):
+                 gpt: GPTService, telegram: TelegramService, broadcast_callback=None):
         self.config = config
         self.db = db
         self.gpt = gpt
         self.telegram = telegram
+        self.broadcast = broadcast_callback
         self.executor = ThreadPoolExecutor(max_workers=3)
     
     def _is_similar_topic(self, headline: str, post_content: str) -> bool:
@@ -79,11 +80,18 @@ class NewsProcessor:
             
             if not triage_result:
                 logger.error("Triage failed")
+                if self.broadcast:
+                    await self.broadcast({"type": "log", "data": {"message": f"❌ Triage failed for {source_channel}", "level": "error"}})
                 return None
             
             bucket = triage_result.get('bucket', 'low')
             
             logger.info(f"Triage result: bucket={bucket}, time={triage_time_ms}ms")
+            
+            # Broadcast triage result to UI
+            if self.broadcast:
+                bucket_emoji = {"high": "🔴", "medium": "🟡", "low": "⚪"}.get(bucket, "⚪")
+                await self.broadcast({"type": "log", "data": {"message": f"{bucket_emoji} Triage: {bucket.upper()} - {source_channel} ({triage_time_ms}ms)", "level": "info"}})
             
             if bucket == 'high':
                 await self._handle_high_importance(
@@ -106,8 +114,8 @@ class NewsProcessor:
     
     async def _handle_high_importance(self, message_data: dict, 
                                      triage_result: dict, current_state: str, triage_time_ms: int = 0):
-        # Check last 10 high posts and ask GPT which one is related
-        recent_posts = self.db.get_recent_high_posts(limit=5)
+        # Check last 3 high posts and ask GPT which one is related
+        recent_posts = self.db.get_recent_high_posts(limit=3)
         similar_post = None
         
         # Filter out posts longer than 1600 characters from similarity check
@@ -136,7 +144,9 @@ class NewsProcessor:
         
         if similar_post and similar_post.get('message_id'):
             # Edit existing message
-            combined_content = f"{similar_post['content']}\n\n---\n\n{post_content}"
+            # Strip @hamidspulse signature from old content to prevent duplication
+            old_content = similar_post['content'].replace('@hamidspulse 🔭', '').strip()
+            combined_content = f"{old_content}\n\n---\n\n{post_content}"
             combined_sources = similar_post.get('source_urls', []) + [message_data['source_url']]
             
             success = await self.telegram.edit_message(similar_post['message_id'], combined_content)
@@ -177,6 +187,9 @@ class NewsProcessor:
     async def _handle_medium_importance(self, message_data: dict, triage_result: dict, triage_time_ms: int = 0):
         logger.info("Queueing MEDIUM importance message")
         
+        if self.broadcast:
+            await self.broadcast({"type": "log", "data": {"message": f"📋 Medium → Digest queue: {message_data['source_channel']}", "level": "info"}})
+        
         self.db.add_to_medium_queue(
             source_channel=message_data['source_channel'],
             source_url=message_data['source_url'],
@@ -201,6 +214,9 @@ class NewsProcessor:
     
     async def _handle_low_importance(self, message_data: dict, triage_result: dict, triage_time_ms: int = 0):
         logger.info("Discarding LOW importance message")
+        
+        if self.broadcast:
+            await self.broadcast({"type": "log", "data": {"message": f"🗑️ Low → Discarded: {message_data['source_channel']}", "level": "info"}})
         
         self.db.log_message(
             source_channel=message_data['source_channel'],
@@ -238,8 +254,8 @@ class NewsProcessor:
             
             tz = pytz.timezone(self.config.timezone)
             now = datetime.now(tz)
-            start_time = now.replace(minute=0, second=0, microsecond=0)
-            end_time = start_time + timedelta(hours=1)
+            end_time = now.replace(minute=0, second=0, microsecond=0)
+            start_time = end_time - timedelta(hours=3)
             
             current_state = self.db.get_current_state()
             

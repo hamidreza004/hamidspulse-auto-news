@@ -362,6 +362,42 @@ class TelegramService:
             logger.error(f"Error getting channel info: {e}")
             return None
     
+    async def download_channel_photo(self, username: str, save_dir: str = "./static/profile_photos") -> Optional[str]:
+        """Download channel profile photo and return relative path"""
+        if not self.client or not self.is_running:
+            return None
+        
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # Get entity
+            if not username.startswith('@'):
+                username = f'@{username}'
+            
+            username_clean = username.lstrip('@')
+            
+            # Parse channel identifier
+            if username_clean.startswith('c/'):
+                channel_id = int(username_clean.split('/', 1)[1])
+                entity = await self.client.get_entity(channel_id)
+            else:
+                entity = await self.client.get_entity(username)
+            
+            # Download profile photo
+            photo_path = os.path.join(save_dir, f"{username_clean}.jpg")
+            photo_file = await self.client.download_profile_photo(entity, file=photo_path)
+            
+            if photo_file:
+                # Return relative path for web access
+                return f"/static/profile_photos/{username_clean}.jpg"
+            else:
+                logger.warning(f"No profile photo available for {username_clean}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error downloading profile photo for {username}: {e}")
+            return None
+    
     async def get_recent_messages(self, channel_username: str, limit: int = 20):
         """Fetch recent messages from a channel"""
         if not self.client or not self.is_running:

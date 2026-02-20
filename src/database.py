@@ -92,6 +92,7 @@ class SourceChannel(Base):
     is_active = Column(Boolean, default=True)
     added_at = Column(DateTime, default=datetime.utcnow)
     last_message_at = Column(DateTime, nullable=True)
+    profile_photo_path = Column(String(500), nullable=True)
 
 
 class DatabaseManager:
@@ -385,9 +386,9 @@ class DatabaseManager:
                 counter = RateLimitCounter(hour_window=current_hour, post_count=1)
                 session.add(counter)
     
-    def add_source_channel(self, username: str, title: str = None, participants_count: int = 0):
+    def add_source_channel(self, username: str, title: str = None, participants_count: int = 0, profile_photo_path: str = None):
         with self.get_session() as session:
-            channel = SourceChannel(username=username, title=title, participants_count=participants_count)
+            channel = SourceChannel(username=username, title=title, participants_count=participants_count, profile_photo_path=profile_photo_path)
             session.add(channel)
     
     def remove_source_channel(self, username: str):
@@ -537,5 +538,6 @@ class DatabaseManager:
                 'is_active': ch.is_active,
                 'added_at': ch.added_at.isoformat() if ch.added_at else None,
                 'last_message_at': ch.last_message_at.isoformat() if ch.last_message_at else None,
-                'participants_count': ch.participants_count if hasattr(ch, 'participants_count') else 0
+                'participants_count': ch.participants_count if hasattr(ch, 'participants_count') else 0,
+                'profile_photo_path': ch.profile_photo_path if hasattr(ch, 'profile_photo_path') else None
             } for ch in channels]

@@ -35,9 +35,10 @@ class MessageQueueManager:
     - Separate worker for processing to never block message receipt
     """
     
-    def __init__(self, db_manager, processor_callback: Callable):
+    def __init__(self, db_manager, processor_callback: Callable, broadcast_callback: Optional[Callable] = None):
         self.db = db_manager
         self.processor = processor_callback
+        self.broadcast = broadcast_callback
         self.queue: asyncio.Queue = asyncio.Queue()
         self.worker_task: Optional[asyncio.Task] = None
         self.is_running = False
@@ -77,12 +78,15 @@ class MessageQueueManager:
         """
         Instantly queue a message (non-blocking, fast)
         """
-        logger.info(f"[QUEUE] Enqueue called for message from {message_data.get('source_channel', 'unknown')}")
+        source_channel = message_data.get('source_channel', 'unknown')
+        logger.info(f"[QUEUE] Enqueue called for message from {source_channel}")
         
         # Check if this message URL was already processed recently
         source_url = message_data.get('source_url', '')
         if source_url and self._is_duplicate(source_url):
             logger.info(f"[QUEUE] ⚠️ Duplicate message detected (already processed): {source_url}")
+            if self.broadcast:
+                await self.broadcast({"type": "log", "data": {"message": f"⚠️ Duplicate from {source_channel}", "level": "warning"}})
             return
         
         # Save to database first
@@ -94,7 +98,10 @@ class MessageQueueManager:
         await self.queue.put({'db_id': db_id, 'data': message_data})
         logger.info(f"[QUEUE] Added to in-memory queue")
         
-        logger.info(f"[QUEUE] ✓ Message queued: {message_data.get('source_channel', 'unknown')} (queue size: {self.queue.qsize()})")
+        queue_size = self.queue.qsize()
+        logger.info(f"[QUEUE] ✓ Message queued: {source_channel} (queue size: {queue_size})")
+        if self.broadcast:
+            await self.broadcast({"type": "log", "data": {"message": f"📥 Queued: {source_channel}", "level": "info"}})
         return True
             
     def _is_duplicate(self, source_url: str) -> bool:
@@ -177,8 +184,12 @@ class MessageQueueManager:
                 
                 # Process the message (this can take time, but doesn't block new messages)
                 try:
-                    logger.info(f"[WORKER] Processing message from queue: {message_data['source_channel']}")
+                    source_ch = message_data['source_channel']
+                    logger.info(f"[WORKER] Processing message from queue: {source_ch}")
                     logger.info(f"[WORKER] Calling processor function...")
+                    
+                    if self.broadcast:
+                        await self.broadcast({"type": "log", "data": {"message": f"⚙️ Processing: {source_ch}", "level": "info"}})
                     
                     await self.processor(message_data)
                     
@@ -196,6 +207,8 @@ class MessageQueueManager:
                             self.processed_urls.pop()
                     
                     logger.info(f"[WORKER] ✓ Message processed successfully (queue size: {self.queue.qsize()})")
+                    if self.broadcast:
+                        await self.broadcast({"type": "log", "data": {"message": f"✅ Processed: {source_ch}", "level": "success"}})
                 
                 except Exception as e:
                     logger.error(f"[WORKER] ✗ Error processing message: {e}", exc_info=True)

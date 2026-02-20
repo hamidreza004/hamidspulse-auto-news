@@ -130,11 +130,11 @@ class GPTService:
 {core_characteristics}
 
 قالب دقیق پست HIGH:
-**عنوان خبر (bold)**
-
-متن توضیح در یک یا دو جمله {high_emoji_count} ایموجی
+{high_emoji_count} ایموجی **عنوان خبر (bold)**
 
 [{source_channel} | لینک]({source_url})
+
+متن توضیح در یک یا دو جمله
 
 @hamidspulse 🔭
 
@@ -144,10 +144,13 @@ class GPTService:
 {emoji_guidelines}
 
 نکات:
-- عنوان بدون براکت، 3-6 کلمه
-- متن کوتاه، مفید
+- ایموجی‌ها قبل از عنوان در همان خط
+- عنوان bold، 3-6 کلمه، بدون براکت
+- لینک منبع بلافاصله در خط بعدی
+- متن توضیح کوتاه و مفید بعد از لینک
 - منبع با فرمت markdown دقیق: [{source_channel} | لینک]({source_url})
-- URL باید دقیقاً همان لینکی باشد که در بخش "لینک" داده شده"""
+- URL باید دقیقاً همان لینکی باشد که در بخش "لینک" داده شده
+- فقط یک بار @hamidspulse 🔭 در انتها"""
 
         key_points = "\n".join([f"- {p}" for p in triage_result.get('key_points', [])])
         user_prompt = f"""وضعیت فعلی:
@@ -196,7 +199,7 @@ class GPTService:
         # Format time as hours only with bold (e.g., "**23:00-00:00**")
         start_hour = start_time.strftime('%H:%M') if hasattr(start_time, 'strftime') else str(start_time)
         end_hour = end_time.strftime('%H:%M') if hasattr(end_time, 'strftime') else str(end_time)
-        title = f"🕐 **{start_hour}–{end_hour}**"
+        title = f"🕐 برخی اخبار **{start_hour}–{end_hour}**"
         
         system_prompt = f"""شما نویسنده محتوای کانال "Hamid's Pulse" هستید.
 
